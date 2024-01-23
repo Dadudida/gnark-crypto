@@ -26,13 +26,18 @@ type Digest = {{ .CurvePackage }}.G1Affine
 
 // ProvingKey used to create or open commitments
 type ProvingKey struct {
-	G1 []{{ .CurvePackage }}.G1Affine  // [G₁ [α]G₁ , [α²]G₁, ... ]
+	G1 []{{ .CurvePackage }}.G1Affine // [G₁ [α]G₁ , [α²]G₁, ... ]
 }
 
 // VerifyingKey used to verify opening proofs
 type VerifyingKey struct {
 	G2 [2]{{ .CurvePackage }}.G2Affine // [G₂, [α]G₂ ]
 	G1 {{ .CurvePackage }}.G1Affine
+{{- if (eq .Name "bn254")}}
+	Lines [2][2][len({{ .CurvePackage }}.LoopCounter)]{{ .CurvePackage }}.LineEvaluationAff // precomputed pairing lines corresponding to G₂, [α]G₂
+{{- else}}
+	Lines [2][2][len({{ .CurvePackage }}.LoopCounter)-1]{{ .CurvePackage }}.LineEvaluationAff // precomputed pairing lines corresponding to G₂, [α]G₂
+{{- end}}
 }
 
 // SRS must be computed through MPC and comprises the ProvingKey and the VerifyingKey
@@ -58,8 +63,10 @@ func eval(p []fr.Element, point fr.Element) fr.Element {
 //
 // In production, a SRS generated through MPC should be used.
 //
+// Set Alpha = -1 to generate quickly a balanced, valid SRS (useful for benchmarking).
+//
 // implements io.ReaderFrom and io.WriterTo
-func NewSRS(size uint64, bAlpha *big.Int)  (*SRS, error) {
+func NewSRS(size uint64, bAlpha *big.Int) (*SRS, error) {
 
 	if size < 2 {
 		return nil, ErrMinSRSSize
@@ -70,11 +77,46 @@ func NewSRS(size uint64, bAlpha *big.Int)  (*SRS, error) {
 	var alpha fr.Element
 	alpha.SetBigInt(bAlpha)
 
+	var bMOne big.Int
+	bMOne.SetInt64(-1)
+
 	_, _, gen1Aff, gen2Aff := {{ .CurvePackage }}.Generators()
+
+	// in this case, the SRS is <αⁱ[G₁]> whera α is of order 4
+	// so no need to run the batch scalar multiplication. We cannot use alpha=1
+	// because it tampers the benchmarks (the SRS is not balanced).
+	if bAlpha.Cmp(&bMOne) == 0 {
+
+		t, err := fr.Generator(4)
+		if err != nil {
+			return &srs, nil
+		}
+		var bt big.Int
+		t.BigInt(&bt)
+
+		var g [4]{{ .CurvePackage }}.G1Affine
+		g[0] = gen1Aff
+		for i := 1; i < 4; i++ {
+			g[i].ScalarMultiplication(&g[i-1], &bt)
+		}
+		parallel.Execute(int(size), func(start, end int) {
+			for i := start; i < int(end); i++ {
+				srs.Pk.G1[i] = g[i%4]
+			}
+		})
+        srs.Vk.G1 = gen1Aff
+		srs.Vk.G2[0] = gen2Aff
+		srs.Vk.G2[1].ScalarMultiplication(&srs.Vk.G2[0], &bt)
+		srs.Vk.Lines[0] = {{ .CurvePackage }}.PrecomputeLines(srs.Vk.G2[0])
+		srs.Vk.Lines[1] = {{ .CurvePackage }}.PrecomputeLines(srs.Vk.G2[1])
+		return &srs, nil
+	}
 	srs.Pk.G1[0] = gen1Aff
 	srs.Vk.G1 = gen1Aff
 	srs.Vk.G2[0] = gen2Aff
 	srs.Vk.G2[1].ScalarMultiplication(&gen2Aff, bAlpha)
+	srs.Vk.Lines[0] = {{ .CurvePackage }}.PrecomputeLines(srs.Vk.G2[0])
+	srs.Vk.Lines[1] = {{ .CurvePackage }}.PrecomputeLines(srs.Vk.G2[1])
 
 	alphas := make([]fr.Element, size-1)
 	alphas[0] = alpha
@@ -129,6 +171,7 @@ func Commit(p []fr.Element, pk ProvingKey, nbTasks ...int) (Digest, error) {
 
 	return res, nil
 }
+
 
 // Open computes an opening proof of polynomial p at given point.
 // fft.Domain Cardinality must be larger than p.Degree()
@@ -187,9 +230,9 @@ func Verify(commitment *Digest, proof *OpeningProof, point fr.Element, vk Verify
 
 
 	// e([f(α)-f(a)+aH(α)]G₁], G₂).e([-H(α)]G₁, [α]G₂) == 1
-	check, err := {{ .CurvePackage }}.PairingCheck(
+	check, err := {{ .CurvePackage }}.PairingCheckFixedQ(
 		[]{{ .CurvePackage }}.G1Affine{totalG1Aff, negH},
-		[]{{ .CurvePackage }}.G2Affine{vk.G2[0], vk.G2[1]},
+		vk.Lines[:],
 	)
 	if err != nil {
 		return err
@@ -446,9 +489,9 @@ func BatchVerifyMultiPoints(digests []Digest, proofs []OpeningProof, points []fr
 
 	// pairing check
 	// e([∑ᵢλᵢ(fᵢ(α) - fᵢ(pᵢ) + pᵢHᵢ(α))]G₁, G₂).e([-∑ᵢλᵢ[Hᵢ(α)]G₁), [α]G₂)
-	check, err := {{ .CurvePackage }}.PairingCheck(
+	check, err := {{ .CurvePackage }}.PairingCheckFixedQ(
 		[]{{ .CurvePackage }}.G1Affine{foldedDigests, foldedQuotients},
-		[]{{ .CurvePackage }}.G2Affine{vk.G2[0], vk.G2[1]},
+		vk.Lines[:],
 	)
 	if err != nil {
 		return err
@@ -509,7 +552,7 @@ func deriveGamma(point fr.Element, digests []Digest, claimedValues []fr.Element,
 			return fr.Element{}, err
 		}
 	}
-	
+
 	for i := 0; i < len(dataTranscript); i++ {
 		if err := fs.Bind("gamma", dataTranscript[i]); err != nil {
 			return fr.Element{}, err
